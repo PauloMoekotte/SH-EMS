@@ -17,47 +17,39 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ⚠️ VERIFIEER DIT IP-ADRES IN JE HOMEWIZARD ENERGY APP:
-# (Instellingen > Apparaten > P1 Meter > IP-adres)
+# ⚠️ VERIFIEER DIT LOKALE IP-ADRES MET JOUW BROWSER:
 HOMEWIZARD_P1_IP = "192.168.2.4"
 CSV_FILENAME = "stroomanalyse.csv"
 
 st.title("⚡ Mijn Persoonlijke Energie Dashboard")
-st.markdown("Live HomeWizard metingen gecombineerd met marktprijzen en jouw historische Jeroen.nl stroomanalyse.")
+st.markdown("Live HomeWizard netwerkmetingen gecombineerd met marktprijzen en jouw historische Jeroen.nl stroomanalyse.")
 
 # ==========================================
-# 2. HOMEWIZARD & MARKT DATA INTEGRATIE
+# 2. HOMEWIZARD LOKALE DATA INTEGRATIE
 # ==========================================
 
 def fetch_local_homewizard_data():
-    """Haalt live data op uit de HomeWizard API met omzeiling van systeem-proxies"""
+    """Haalt live data op uit de HomeWizard P1 Meter via het lokale wifinetwerk"""
     url = f"http://{HOMEWIZARD_P1_IP}/api/v1/data"
     
-    # We forceren Python om GEEN gebruik te maken van actieve VPN/Proxy-instellingen 
-    # voor dit specifieke verzoek naar je interne netwerk.
+    # We forceren Python om eventuele actieve VPN/Proxy-instellingen op je pc te negeren
     session = requests.Session()
     session.trust_env = False 
     
     try:
-        # We sturen exact dezelfde basis-headers mee als een standaard webbrowser
+        # Browser-achtige headers meesturen voorkomt netwerkweigeringen
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
             "Accept": "application/json"
         }
-        
-        response = session.get(url, headers=headers, timeout=4)
+        response = session.get(url, headers=headers, timeout=3)
         
         if response.status_code == 200:
             res = response.json()
-            
-            # P1 Meter API data mapping
             net_w = res.get('active_power_w', 0)
             
-            # Sommige P1-meters geven opwek door onder 'active_power_production_w'.
-            # Als je een aparte HomeWizard kWh-meter gebruikt, heet het vaak 'total_solar_power_w'.
+            # P1 meters vangen opwek op via 'active_power_production_w'
             solar_w = res.get('active_power_production_w', res.get('total_solar_power_w', 0))
-            
-            # Thuisbatterij waarden
             battery_soc = res.get('battery_soc_percent', 0)
             battery_w = res.get('active_battery_power_w', 0)
             
@@ -69,18 +61,68 @@ def fetch_local_homewizard_data():
                 "error": None
             }
         else:
-            return {"net_grid_kw": 0.0, "solar_kw": 0.0, "battery_soc": 0, "battery_kw": 0.0, 
-                    "error": f"Server gaf HTTP {response.status_code}"}
+            return {
+                "net_grid_kw": 0.0, "solar_kw": 0.0, "battery_soc": 0, "battery_kw": 0.0, 
+                "error": f"HomeWizard gaf HTTP statuscode {response.status_code}"
+            }
             
-    except requests.exceptions.Timeout:
-        return {"net_grid_kw": 0.0, "solar_kw": 0.0, "battery_soc": 0, "battery_kw": 0.0, 
-                "error": "Timeout: Het apparaat reageerde te traag."}
-    except requests.exceptions.ConnectionError as ce:
-        return {"net_grid_kw": 0.0, "solar_kw": 0.0, "battery_soc": 0, "battery_kw": 0.0, 
-                "error": f"Verbinding geweigerd door netwerk: {str(ce)}"}
     except Exception as e:
-        return {"net_grid_kw": 0.0, "solar_kw": 0.0, "battery_soc": 0, "battery_kw": 0.0, 
-                "error": f"Onverwachte fout: {str(e)}"}
+        # Volledige foutomschrijving teruggeven om crashes te voorkomen
+        return {
+            "net_grid_kw": 0.0, "solar_kw": 0.0, "battery_soc": 0, "battery_kw": 0.0,
+            "error": f"Kan geen verbinding maken met {HOMEWIZARD_P1_IP}. Details: {str(e)}"
+        }
+
+@st.cache_data(ttl=900)
+def generate_fallback_prices():
+    times = [f"{str(i).zfill(2)}:00" for i in range(24)]
+    prices = [0.35, 0.34, 0.33, 0.33, 0.32, 0.33, 0.35, 0.38, 0.39, 0.36, 0.32, 0.26, 0.20, 0.17, 0.18, 0.23, 0.30, 0.37, 0.42, 0.49, 0.43, 0.40, 0.38, 0.34]
+    return pd.DataFrame({'Uur': times, 'All-in prijs (€/kWh)': prices})
+
+# --- Data ophalen ---
+hw_metrics = fetch_local_homewizard_data()
+df_prices = generate_fallback_prices()
+
+# Toewijzen met veilige fallbacks
+solar_production_kw = hw_metrics.get("solar_kw", 0.0)
+net_grid_kw = hw_metrics.get("net_grid_kw", 0.0)
+battery_soc = hw_metrics.get("battery_soc", 0)
+battery_kw = hw_metrics.get("battery_kw", 0.0)
+house_consumption_kw = max(0, solar_production_kw + net_grid_kw - battery_kw)
+
+# ==========================================
+# 3. JOUW JEROEN.NL CSV INLADEN & VERWERKEN
+# ==========================================
+@st.cache_data
+def load_local_stroomanalyse(filename):
+    if os.path.exists(filename):
+        try:
+            df = pd.read_csv(filename, sep=None, engine='python')
+            df.columns = df.columns.str.strip()
+            if 'DatumTijd' in df.columns:
+                df['DatumTijd'] = pd.to_datetime(df['DatumTijd'])
+            return df, None
+        except Exception as e:
+            return None, f"Fout bij lezen bestand: {e}"
+    else:
+        base = datetime.now()
+        times = [base - timedelta(minutes=15 * x) for x in range(0, 96)]
+        times.reverse()
+        df_dummy = pd.DataFrame({
+            'DatumTijd': times, 
+            'Import': np.random.uniform(0.1, 1.2, 96),
+            'Export': np.random.uniform(0.0, 2.0, 96), 
+            'Opwek': np.sin(np.linspace(0, np.pi, 96)) * 2.5,
+            'DatumTijdUTC': times
+        })
+        df_dummy.loc[df_dummy['Opwek'] < 0, 'Opwek'] = 0
+        return df_dummy, f"Bestand '{filename}' niet gevonden. Dummy data geladen."
+
+df_history, csv_warning = load_local_stroomanalyse(CSV_FILENAME)
+
+if not csv_warning and df_history is not None:
+    df_history['Werkelijk_Verbruik'] = df_history['Import'] + df_history['Opwek'] - df_history['Export']
+    df_history['Werkelijk_Verbruik'] = df_history['Werkelijk_Verbruik'].clip(lower=0)
 
 # ==========================================
 # 4. SIDEBAR & VERBINDING STATUS
@@ -88,11 +130,13 @@ def fetch_local_homewizard_data():
 st.sidebar.header("⚙️ Systeem Status")
 st.sidebar.markdown("**Fysieke Hardware (Live):**")
 
-if hw_metrics["error"]:
-    st.sidebar.error(f"🔴 HomeWizard P1: Offline")
-    st.sidebar.warning(f"Foutmelding: {hw_metrics['error']}")
+# Waterdichte controle op foutmeldingen
+hw_error = hw_metrics.get("error")
+if hw_error:
+    st.sidebar.error("🔴 HomeWizard P1: Offline")
+    st.sidebar.warning(hw_error)
 else:
-    st.sidebar.success("🟢 HomeWizard P1 Hub: Verbonden")
+    st.sidebar.success("🟢 HomeWizard P1 Hub: Live verbonden")
 
 st.sidebar.markdown("**Historische Database:**")
 if csv_warning:
@@ -132,7 +176,7 @@ col_left, col_right = st.columns(2)
 with col_left:
     st.subheader("📈 Dynamische Stroomprijzen Vandaag (All-in)")
     fig_prices = px.bar(df_prices, x='Uur', y='All-in prijs (€/kWh)', color_discrete_sequence=['#00CC96'])
-    fig_prices.update_layout(margin=dict(l=20, r=20, t=20, b=20), hovermode="x unified")
+    fig_prices.update_layout(margin=dict(l=20, r=20, t=20), hovermode="x unified")
     st.plotly_chart(fig_prices, use_container_width=True)
 
 with col_right:
@@ -148,5 +192,5 @@ with col_right:
         fig_hist.add_trace(go.Scatter(x=df_history['DatumTijd'], y=df_history['Import'], name='Import', line=dict(color='#FF4B4B')))
         fig_hist.add_trace(go.Scatter(x=df_history['DatumTijd'], y=df_history['Opwek'], name='Opwek', line=dict(color='#00CC96'), fill='tozeroy'))
 
-    fig_hist.update_layout(margin=dict(l=20, r=20, t=20, b=20), hovermode="x unified")
+    fig_hist.update_layout(margin=dict(l=20, r=20, t=20), hovermode="x unified")
     st.plotly_chart(fig_hist, use_container_width=True)
