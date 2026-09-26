@@ -17,7 +17,8 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ⚠️ PAS HIER JOUW LOKALE IP-ADRES EN BESTANDSNAAM AAN:
+# ⚠️ VERIFIEER DIT IP-ADRES IN JE HOMEWIZARD ENERGY APP:
+# (Instellingen > Apparaten > P1 Meter > IP-adres)
 HOMEWIZARD_P1_IP = "192.168.2.4"
 CSV_FILENAME = "stroomanalyse.csv"
 
@@ -29,35 +30,50 @@ st.markdown("Live HomeWizard metingen gecombineerd met marktprijzen en jouw hist
 # ==========================================
 
 def fetch_local_homewizard_data():
-    """Haalt alle live data (Netstroom én Opwek) rechtstreeks op uit de HomeWizard API"""
+    """Haalt alle live data rechtstreeks op uit de HomeWizard Lokale API v1 endpoint"""
+    url = f"http://{HOMEWIZARD_P1_IP}/api/v1/data"
     try:
-        res = requests.get(f"http://{HOMEWIZARD_P1_IP}/api/v1/data", timeout=2).json()
+        # We zetten een strakke timeout. Als de meter niet reageert, ligt het vaak aan de Lokale API-instelling.
+        response = requests.get(url, timeout=3)
         
-        # active_power_w is het netto vermogen (positief = import, negatief = export)
-        net_w = res.get('active_power_w', 0)
-        
-        # HomeWizard stuurt vaak ook de opwek (en eventueel batterij) mee als die gekoppeld zijn.
-        # We proberen de opwek uit de API te halen. Mocht jouw specifieke HomeWizard setup 
-        # een andere key gebruiken (zoals 'active_power_l1_w' etc.), dan vallen we terug op 0.
-        solar_w = res.get('total_solar_power_w', res.get('active_power_production_w', 0))
-        
-        # Mocht je een thuisbatterij via HomeWizard hebben gekoppeld:
-        battery_soc = res.get('battery_soc_percent', 0) 
-        battery_w = res.get('active_battery_power_w', 0)
-        
-        return {
-            "net_grid_kw": net_w / 1000.0,
-            "solar_kw": solar_w / 1000.0,
-            "battery_soc": battery_soc,
-            "battery_kw": battery_w / 1000.0,
-            "error": None
-        }
+        if response.status_code == 200:
+            res = response.json()
+            
+            # Standaard P1 Meter API specificaties van HomeWizard:
+            # 'active_power_w' is het huidige netto vermogen (Import = positief, Export = negatief)
+            net_w = res.get('active_power_w', 0)
+            
+            # Als je zonnepanelen via een extra HomeWizard kWh-meter of omvormer-koppeling in dezelfde app zitten,
+            # kan de P1 meter deze soms doorgeven. We proberen de juiste sleutels te vinden.
+            solar_w = res.get('active_power_production_w', res.get('total_solar_power_w', 0))
+            
+            # Thuisbatterij sleutels indien aanwezig
+            battery_soc = res.get('battery_soc_percent', 0)
+            battery_w = res.get('active_battery_power_w', 0)
+            
+            return {
+                "net_grid_kw": net_w / 1000.0,
+                "solar_kw": solar_w / 1000.0,
+                "battery_soc": battery_soc,
+                "battery_kw": battery_w / 1000.0,
+                "error": None
+            }
+        else:
+            return {"net_grid_kw": 0.0, "solar_kw": 0.0, "battery_soc": 0, "battery_kw": 0.0, 
+                    "error": f"HTTP statuscode {response.status_code}"}
+            
+    except requests.exceptions.Timeout:
+        return {"net_grid_kw": 0.0, "solar_kw": 0.0, "battery_soc": 0, "battery_kw": 0.0, 
+                "error": "Time-out. Controleer of het IP-adres klopt en de P1-meter stroom heeft."}
+    except requests.exceptions.ConnectionError:
+        return {"net_grid_kw": 0.0, "solar_kw": 0.0, "battery_soc": 0, "battery_kw": 0.0, 
+                "error": "Verbindingsfout. Staat 'Lokale API' wel AAN in de HomeWizard app?"}
     except Exception as e:
-        return {"net_grid_kw": 0.0, "solar_kw": 0.0, "battery_soc": 0, "battery_kw": 0.0, "error": str(e)}
+        return {"net_grid_kw": 0.0, "solar_kw": 0.0, "battery_soc": 0, "battery_kw": 0.0, 
+                "error": str(e)}
 
 @st.cache_data(ttl=900)
 def generate_fallback_prices():
-    """Genereert realistische all-in prijzen als de openbare data niet laadt"""
     times = [f"{str(i).zfill(2)}:00" for i in range(24)]
     prices = [0.35, 0.34, 0.33, 0.33, 0.32, 0.33, 0.35, 0.38, 0.39, 0.36, 0.32, 0.26, 0.20, 0.17, 0.18, 0.23, 0.30, 0.37, 0.42, 0.49, 0.43, 0.40, 0.38, 0.34]
     return pd.DataFrame({'Uur': times, 'All-in prijs (€/kWh)': prices})
@@ -66,7 +82,7 @@ def generate_fallback_prices():
 hw_metrics = fetch_local_homewizard_data()
 df_prices = generate_fallback_prices()
 
-# Live variabelen toewijzen vanuit één bron
+# Live variabelen toewijzen vanuit de API
 solar_production_kw = hw_metrics["solar_kw"]
 net_grid_kw = hw_metrics["net_grid_kw"]
 battery_soc = hw_metrics["battery_soc"]
@@ -80,7 +96,6 @@ house_consumption_kw = max(0, solar_production_kw + net_grid_kw - battery_kw)
 # ==========================================
 @st.cache_data
 def load_local_stroomanalyse(filename):
-    """Laadt de handmatige export van Jeroen.nl met specifieke kolommen in"""
     if os.path.exists(filename):
         try:
             df = pd.read_csv(filename, sep=None, engine='python')
@@ -95,10 +110,8 @@ def load_local_stroomanalyse(filename):
         times = [base - timedelta(minutes=15 * x) for x in range(0, 96)]
         times.reverse()
         df_dummy = pd.DataFrame({
-            'DatumTijd': times,
-            'Import': np.random.uniform(0.1, 1.2, 96),
-            'Export': np.random.uniform(0.0, 2.0, 96),
-            'Opwek': np.sin(np.linspace(0, np.pi, 96)) * 2.5,
+            'DatumTijd': times, 'Import': np.random.uniform(0.1, 1.2, 96),
+            'Export': np.random.uniform(0.0, 2.0, 96), 'Opwek': np.sin(np.linspace(0, np.pi, 96)) * 2.5,
             'DatumTijdUTC': times
         })
         df_dummy.loc[df_dummy['Opwek'] < 0, 'Opwek'] = 0
@@ -115,7 +128,12 @@ if not csv_warning and df_history is not None:
 # ==========================================
 st.sidebar.header("⚙️ Systeem Status")
 st.sidebar.markdown("**Fysieke Hardware (Live):**")
-st.sidebar.success("🟢 HomeWizard P1 Hub" if not hw_metrics["error"] else f"🔴 HomeWizard: Offline")
+
+if hw_metrics["error"]:
+    st.sidebar.error(f"🔴 HomeWizard P1: Offline")
+    st.sidebar.warning(f"Foutmelding: {hw_metrics['error']}")
+else:
+    st.sidebar.success("🟢 HomeWizard P1 Hub: Verbonden")
 
 st.sidebar.markdown("**Historische Database:**")
 if csv_warning:
